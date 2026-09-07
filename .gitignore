@@ -1,0 +1,6 @@
+node_modules/
+dist/
+test-app/node_modules/
+test-app/.next/
+*.tgz
+.env
