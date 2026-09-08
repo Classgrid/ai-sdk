@@ -85,6 +85,7 @@ async function tryProvider(
   timeoutMs: number,
   onStatus?: (label: string) => void,
   onThought?: (thought: string) => void,
+  onToken?: (token: string) => void,
   depth: number = 0
 ): Promise<LLMProviderResult> {
   const verbose = config.verbose !== false;
@@ -93,7 +94,7 @@ async function tryProvider(
   const startTime = Date.now();
   const maxDepth = config.maxToolDepth ?? 2;
 
-  const allTools = [...(config.tools || [])];
+  const allTools = [INTERNAL_THOUGHT_TOOL, ...(config.tools || [])];
 
   if (verbose) {
     console.log(`\n🚀 [llm] Requesting answer from ${provider.name.toUpperCase()} (${provider.model})...`);
@@ -113,6 +114,8 @@ async function tryProvider(
         temperature,
         ...(provider.name !== "gemini" ? { max_tokens: maxTokens } : {}),
         tools: allTools.length > 0 ? allTools : undefined,
+        // Enable streaming only for the final answer (depth 0, no tool forcing)
+        ...(onToken && depth === 0 ? { stream: true } : {}),
       }),
     });
 
@@ -125,7 +128,49 @@ async function tryProvider(
       return { answer: null, rateLimited: false, error: `http_${response.status}` };
     }
 
-    const data = await response.json();
+    const isStreaming = onToken && depth === 0 && response.headers.get("content-type")?.includes("text/event-stream");
+
+    if (isStreaming && response.body) {
+      // Stream tokens in real-time
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (raw === "[DONE]") break;
+          try {
+            const chunk = JSON.parse(raw);
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              fullContent += delta;
+              onToken(delta);
+            }
+            // Handle tool calls in stream
+            const toolCalls = chunk.choices?.[0]?.delta?.tool_calls;
+            if (toolCalls) {
+              // If tool calls appear during streaming, fall back to non-stream
+              reader.cancel();
+              break;
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+      clearTimeout(timeout);
+      if (fullContent) return { answer: fullContent, rateLimited: false };
+      // Fall back to non-streaming if content was empty (tool calls etc)
+    }
+
+    const data = await (isStreaming ? Promise.resolve(null) : response.json());
+    if (!data) return { answer: null, rateLimited: false, error: "stream_fallback" };
     const result = extractResponse(data);
 
     // Emit thinking — truncate to 3-4 lines max for clean UI
@@ -173,7 +218,7 @@ async function tryProvider(
             },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth + 1);
         }
 
         let args: Record<string, unknown>;
@@ -186,7 +231,7 @@ async function tryProvider(
             { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth + 1);
         }
 
         if (verbose) console.log(`🧠 [thinking via tool] ${provider.name}: ${(args.thought as string).slice(0, 200)}...`);
@@ -202,7 +247,7 @@ async function tryProvider(
         ];
         clearTimeout(timeout);
         // Don't increment depth for thinking — don't punish reasoning
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth);
+        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth);
       }
 
       // Handle custom tool calls
@@ -218,7 +263,7 @@ async function tryProvider(
             { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth + 1);
         }
 
         // Duplicate tool call blocking
@@ -242,7 +287,7 @@ async function tryProvider(
             },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth + 1);
         }
 
         onStatus?.(toolName.replace(/_/g, " "));
@@ -262,7 +307,7 @@ async function tryProvider(
           { role: "tool", tool_call_id: call.id, content: toolResult.slice(0, 6000) },
         ];
         clearTimeout(timeout);
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, depth + 1);
+        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, depth + 1);
       }
     }
 
@@ -331,6 +376,7 @@ export function createLLMClient(config: LLMClientConfig): LLMClient {
       timeoutMs = config.defaultTimeoutMs ?? 60000,
       onStatus,
       onThought,
+      onToken,
     }: LLMOptions): Promise<string | null> {
       if (config.providers.length === 0) {
         console.error("[llm] No providers configured.");
@@ -348,7 +394,8 @@ export function createLLMClient(config: LLMClientConfig): LLMClient {
           maxTokens,
           timeoutMs,
           onStatus,
-          onThought
+          onThought,
+          onToken
         );
 
         if (result.answer) return result.answer;

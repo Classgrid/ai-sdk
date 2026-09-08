@@ -43,6 +43,7 @@ export type LLMOptions = {
   tools?: ToolDefinition[];
   onStatus?: (label: string) => void;
   onThought?: (thought: string) => void;
+  onToken?: (token: string) => void;
 };
 
 /** A tool definition for the LLM to call. */
