@@ -93,7 +93,7 @@ async function tryProvider(
   const startTime = Date.now();
   const maxDepth = config.maxToolDepth ?? 2;
 
-  const allTools = [INTERNAL_THOUGHT_TOOL, ...(config.tools || [])];
+  const allTools = [...(config.tools || [])];
 
   if (verbose) {
     console.log(`\n🚀 [llm] Requesting answer from ${provider.name.toUpperCase()} (${provider.model})...`);
@@ -128,12 +128,13 @@ async function tryProvider(
     const data = await response.json();
     const result = extractResponse(data);
 
-    // Emit thinking
+    // Emit thinking — truncate to 3-4 lines max for clean UI
     if (result.thinking) {
       if (verbose) {
         console.log(`\n🧠 [thinking] ${provider.name.toUpperCase()}: ${result.thinking.slice(0, 200)}...`);
       }
-      onThought?.(result.thinking.trim());
+      const lines = result.thinking.trim().split("\n").slice(0, 4).join("\n");
+      onThought?.(lines);
     }
 
     // Handle Tool Calling
@@ -189,7 +190,9 @@ async function tryProvider(
         }
 
         if (verbose) console.log(`🧠 [thinking via tool] ${provider.name}: ${(args.thought as string).slice(0, 200)}...`);
-        onThought?.(args.thought as string);
+        // Truncate thought to 3-4 lines max for clean UI
+        const lines = (args.thought as string).split("\n").slice(0, 4).join("\n");
+        onThought?.(lines);
         onStatus?.("analyzing");
 
         const nextMessages: ChatMessage[] = [
