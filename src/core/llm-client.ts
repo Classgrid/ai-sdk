@@ -94,7 +94,7 @@ async function tryProvider(
   const startTime = Date.now();
   const maxDepth = config.maxToolDepth ?? 2;
 
-  const allTools = [INTERNAL_THOUGHT_TOOL, ...(config.tools || [])];
+  const allTools = [...(config.tools || [])];
 
   if (verbose) {
     console.log(`\n🚀 [llm] Requesting answer from ${provider.name.toUpperCase()} (${provider.model})...`);
