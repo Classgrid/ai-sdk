@@ -154,6 +154,13 @@ async function tryProvider(
               fullContent += delta;
               onToken(delta);
             }
+            
+            // Capture native reasoning tokens (e.g. from gpt-oss-20b)
+            const reasoning = chunk.choices?.[0]?.delta?.reasoning;
+            if (reasoning) {
+              onThought?.(reasoning);
+            }
+
             // Handle tool calls in stream
             const toolCalls = chunk.choices?.[0]?.delta?.tool_calls;
             if (toolCalls) {
