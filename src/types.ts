@@ -44,6 +44,10 @@ export type LLMOptions = {
   onStatus?: (label: string) => void;
   onThought?: (thought: string) => void;
   onToken?: (token: string) => void;
+  /** Called when the LLM invokes a tool (before execution) */
+  onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
+  /** Called after a tool finishes executing */
+  onToolResult?: (toolName: string, result: string) => void;
 };
 
 /** A tool definition for the LLM to call. */
