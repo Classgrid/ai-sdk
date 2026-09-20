@@ -139,5 +139,6 @@ export function extractResponse(data: unknown): ExtractedResponse {
     content: (content as string) || null,
     toolCalls: message.tool_calls as ExtractedResponse["toolCalls"],
     thinking,
+    usage: (data as any).usage || null,
   };
 }

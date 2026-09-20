@@ -88,7 +88,8 @@ async function tryProvider(
   onToken?: (token: string) => void,
   onToolCall?: (toolName: string, args: Record<string, unknown>) => void,
   onToolResult?: (toolName: string, result: string) => void,
-  depth: number = 0
+  depth: number = 0,
+  toolFailures: Record<string, number> = {}
 ): Promise<LLMProviderResult> {
   const verbose = config.verbose !== false;
   const controller = new AbortController();
@@ -117,7 +118,7 @@ async function tryProvider(
         ...(provider.name !== "gemini" ? { max_tokens: maxTokens } : {}),
         tools: allTools.length > 0 ? allTools : undefined,
         // Enable streaming only for the final answer (depth 0, no tool forcing)
-        ...(onToken && depth === 0 ? { stream: true } : {}),
+        ...(onToken && depth === 0 ? { stream: true, stream_options: { include_usage: true } } : {}),
       }),
     });
 
@@ -138,6 +139,7 @@ async function tryProvider(
       const decoder = new TextDecoder();
       let fullContent = "";
       let buffer = "";
+      let streamUsage: Record<string, unknown> | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -170,17 +172,31 @@ async function tryProvider(
               reader.cancel();
               break;
             }
+
+            // Capture usage from final chunk if present
+            if (chunk.usage) {
+              streamUsage = chunk.usage;
+            }
           } catch { /* skip malformed */ }
         }
       }
       clearTimeout(timeout);
-      if (fullContent) return { answer: fullContent, rateLimited: false };
+      
+      if (streamUsage && verbose) {
+        console.log(`\n🎯 [TOKEN USAGE (Stream)] ${provider.name} | prompt: ${streamUsage?.prompt_tokens} | completion: ${streamUsage?.completion_tokens} | total: ${streamUsage?.total_tokens}`);
+      }
+      
+      if (fullContent) return { answer: fullContent, rateLimited: false, usage: streamUsage };
       // Fall back to non-streaming if content was empty (tool calls etc)
     }
 
     const data = await (isStreaming ? Promise.resolve(null) : response.json());
     if (!data) return { answer: null, rateLimited: false, error: "stream_fallback" };
     const result = extractResponse(data);
+
+    if (data?.usage && verbose) {
+      console.log(`\n🎯 [TOKEN USAGE (Non-Stream)] ${provider.name} | prompt: ${data.usage.prompt_tokens} | completion: ${data.usage.completion_tokens} | total: ${data.usage.total_tokens}`);
+    }
 
     // Emit thinking — truncate to 3-4 lines max for clean UI
     if (result.thinking) {
@@ -227,7 +243,7 @@ async function tryProvider(
             },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
         }
 
         let args: Record<string, unknown>;
@@ -240,7 +256,7 @@ async function tryProvider(
             { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
         }
 
         if (verbose) console.log(`🧠 [thinking via tool] ${provider.name}: ${(args.thought as string).slice(0, 200)}...`);
@@ -256,7 +272,7 @@ async function tryProvider(
         ];
         clearTimeout(timeout);
         // Don't increment depth for thinking — don't punish reasoning
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth);
+        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth, toolFailures);
       }
 
       // Handle custom tool calls
@@ -272,7 +288,7 @@ async function tryProvider(
             { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
         }
 
         // Duplicate tool call blocking
@@ -296,7 +312,7 @@ async function tryProvider(
             },
           ];
           clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1);
+          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
         }
 
         onStatus?.(toolName.replace(/_/g, " "));
@@ -313,23 +329,48 @@ async function tryProvider(
 
         onStatus?.("analyzing");
 
+        const isError = toolResult.toLowerCase().includes("error") || toolResult.toLowerCase().includes("failed") || toolResult.toLowerCase().includes("exception");
+        if (isError) {
+          toolFailures[toolName] = (toolFailures[toolName] || 0) + 1;
+        }
+
+        const totalFailures = Object.values(toolFailures).reduce((a, b) => a + b, 0);
+
+        if (toolFailures[toolName] >= 2) {
+          if (verbose) console.error(`❌ [llm:${provider.name}] Tool ${toolName} failed 2 times. Aborting retry loop.`);
+          return {
+            answer: `I tried to use the ${toolName} tool but it failed multiple times. Please check the logs. Last error: ${toolResult}`,
+            rateLimited: false,
+            error: "tool_failure_limit",
+          };
+        }
+
+        if (totalFailures >= 3) {
+          if (verbose) console.error(`❌ [llm:${provider.name}] Global tool failure limit reached (${totalFailures} total errors). Aborting loop to prevent runaway execution.`);
+          return {
+            answer: `I have encountered multiple errors while trying to complete this task. To prevent further issues, I have stopped trying. Please review the logs to see what went wrong.`,
+            rateLimited: false,
+            error: "global_tool_failure_limit",
+          };
+        }
+
         const nextMessages: ChatMessage[] = [
           ...messages,
           { role: "assistant", content: result.content || "", tool_calls: [call] },
           { role: "tool", tool_call_id: call.id, content: toolResult.slice(0, 6000) },
         ];
         clearTimeout(timeout);
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1);
+        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
       }
     }
 
     // Return final answer
     if (result.content && verbose) {
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      console.log(`✅ [llm] ${provider.name.toUpperCase()} answered in ${duration}s!`);
+      // Intentionally removed the ✅ [llm] log here because we now log a much more
+      // detailed token breakdown natively in the ai-chat.controller.js
     }
 
-    return { answer: result.content || null, rateLimited: false };
+    return { answer: result.content || null, rateLimited: false, usage: data?.usage || null };
   } catch (error) {
     const name = error instanceof Error ? error.name : "";
     const message = error instanceof Error ? error.message : String(error);
@@ -348,7 +389,7 @@ async function tryProvider(
 
 export type LLMClient = {
   /** Generate a reply using the provider fallback chain. */
-  generate: (options: LLMOptions) => Promise<string | null>;
+  generate: (options: LLMOptions) => Promise<{ answer: string | null; usage?: Record<string, unknown> | null }>;
   /** Get the current primary model name. */
   getModel: () => string;
 };
@@ -391,10 +432,10 @@ export function createLLMClient(config: LLMClientConfig): LLMClient {
       onToken,
       onToolCall,
       onToolResult,
-    }: LLMOptions): Promise<string | null> {
+    }: LLMOptions): Promise<{ answer: string | null; usage?: Record<string, unknown> | null }> {
       if (config.providers.length === 0) {
         console.error("[llm] No providers configured.");
-        return null;
+        return { answer: null, usage: null };
       }
 
       let allRateLimited = true;
@@ -414,7 +455,7 @@ export function createLLMClient(config: LLMClientConfig): LLMClient {
           onToolResult
         );
 
-        if (result.answer) return result.answer;
+        if (result.answer) return { answer: result.answer, usage: result.usage };
 
         if (!result.rateLimited) allRateLimited = false;
 
@@ -425,11 +466,11 @@ export function createLLMClient(config: LLMClientConfig): LLMClient {
 
       if (allRateLimited) {
         console.error("[llm] All providers rate-limited.");
-        return "[RATE_LIMITED]";
+        return { answer: "[RATE_LIMITED]", usage: null };
       }
 
       console.error("[llm] All providers failed.");
-      return null;
+      return { answer: null, usage: null };
     },
   };
 }

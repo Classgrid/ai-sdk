@@ -65,6 +65,7 @@ export type LLMProviderResult = {
   answer: string | null;
   rateLimited: boolean;
   error?: string;
+  usage?: Record<string, unknown> | null;
 };
 
 /** Extracted response from raw LLM output. */
@@ -72,6 +73,7 @@ export type ExtractedResponse = {
   content: string | null;
   toolCalls?: ToolCall[];
   thinking?: string | null;
+  usage?: Record<string, unknown> | null;
 };
 
 // ── RAG Types ────────────────────────────────────────────────────────────────
@@ -150,6 +152,7 @@ export type GenerateAnswerResult = {
   answer: string | null;
   retrieval: RetrievalResult;
   sources: RetrievedChunk[];
+  usage?: Record<string, unknown> | null;
 };
 
 // ── Embedding Types ──────────────────────────────────────────────────────────
