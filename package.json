@@ -1,6 +1,6 @@
 {
   "name": "@classgrid/ai",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The full-stack AI SDK for building intelligent, multi-channel AI agents with RAG, memory, tool calling, and provider fallback — built by Classgrid.",
   "author": "Nikhil Shinde <nikhil.shinde@classgrid.in>",
   "license": "MIT",

@@ -4,8 +4,10 @@
  * A production-hardened LLM client with:
  *   - Automatic provider fallback chain (e.g., Gemini → Mistral → OpenAI)
  *   - Built-in tool calling with loop protection and depth limits
+ *   - Full parallel tool execution (processes ALL tool calls, not just the first)
  *   - Duplicate tool call blocking
  *   - Universal thinking extraction from any provider
+ *   - <think> tag streaming support (DeepSeek-style models)
  *   - Rate-limit detection and graceful degradation
  *
  * Usage:
@@ -134,12 +136,14 @@ async function tryProvider(
     const isStreaming = onToken && depth === 0 && response.headers.get("content-type")?.includes("text/event-stream");
 
     if (isStreaming && response.body) {
-      // Stream tokens in real-time
+      // ── Stream tokens in real-time with <think> tag filtering ──
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullContent = "";
       let buffer = "";
       let streamUsage: Record<string, unknown> | null = null;
+      let isInsideThink = false;
+      let thinkBuffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -155,8 +159,81 @@ async function tryProvider(
             const chunk = JSON.parse(raw);
             const delta = chunk.choices?.[0]?.delta?.content;
             if (delta) {
-              fullContent += delta;
-              onToken(delta);
+              // Buffer content to filter <think>...</think> tags
+              thinkBuffer += delta;
+
+              while (thinkBuffer.length > 0) {
+                if (!isInsideThink) {
+                  const startIdx = thinkBuffer.indexOf("<think>");
+                  if (startIdx !== -1) {
+                    // Emit everything before the <think> tag as content
+                    if (startIdx > 0) {
+                      const before = thinkBuffer.slice(0, startIdx);
+                      fullContent += before;
+                      onToken(before);
+                    }
+                    isInsideThink = true;
+                    thinkBuffer = thinkBuffer.slice(startIdx + 7); // 7 = "<think>".length
+                  } else {
+                    // Check for partial <think> match at end of buffer
+                    let partialMatch = false;
+                    for (let i = 1; i <= 6; i++) {
+                      if (thinkBuffer.length >= i && thinkBuffer.endsWith("<think>".slice(0, i))) {
+                        // Hold back the partial match, emit the rest
+                        const emitLen = thinkBuffer.length - i;
+                        if (emitLen > 0) {
+                          const safe = thinkBuffer.slice(0, emitLen);
+                          fullContent += safe;
+                          onToken(safe);
+                          thinkBuffer = thinkBuffer.slice(emitLen);
+                        }
+                        partialMatch = true;
+                        break;
+                      }
+                    }
+                    if (!partialMatch) {
+                      // No <think> anywhere — emit everything
+                      fullContent += thinkBuffer;
+                      onToken(thinkBuffer);
+                      thinkBuffer = "";
+                    } else {
+                      break; // Wait for more data
+                    }
+                  }
+                } else {
+                  // Inside <think> — route to onThought instead of onToken
+                  const endIdx = thinkBuffer.indexOf("</think>");
+                  if (endIdx !== -1) {
+                    if (endIdx > 0) {
+                      const thoughtStr = thinkBuffer.slice(0, endIdx);
+                      onThought?.(thoughtStr);
+                    }
+                    isInsideThink = false;
+                    thinkBuffer = thinkBuffer.slice(endIdx + 8); // 8 = "</think>".length
+                  } else {
+                    // Check for partial </think> match at end
+                    let partialMatch = false;
+                    for (let i = 1; i <= 7; i++) {
+                      if (thinkBuffer.length >= i && thinkBuffer.endsWith("</think>".slice(0, i))) {
+                        const emitLen = thinkBuffer.length - i;
+                        if (emitLen > 0) {
+                          const safe = thinkBuffer.slice(0, emitLen);
+                          onThought?.(safe);
+                          thinkBuffer = thinkBuffer.slice(emitLen);
+                        }
+                        partialMatch = true;
+                        break;
+                      }
+                    }
+                    if (!partialMatch) {
+                      onThought?.(thinkBuffer);
+                      thinkBuffer = "";
+                    } else {
+                      break; // Wait for more data
+                    }
+                  }
+                }
+              }
             }
             
             // Capture native reasoning tokens (e.g. from gpt-oss-20b)
@@ -180,6 +257,16 @@ async function tryProvider(
           } catch { /* skip malformed */ }
         }
       }
+
+      // Flush remaining think buffer
+      if (thinkBuffer) {
+        if (isInsideThink) onThought?.(thinkBuffer);
+        else {
+          fullContent += thinkBuffer;
+          onToken(thinkBuffer);
+        }
+      }
+
       clearTimeout(timeout);
       
       if (streamUsage && verbose) {
@@ -207,7 +294,7 @@ async function tryProvider(
       onThought?.(lines);
     }
 
-    // Handle Tool Calling
+    // ── Handle Tool Calling — process ALL parallel tool calls ──
     if (result.toolCalls && result.toolCalls.length > 0) {
       if (depth >= maxDepth) {
         if (verbose) console.error(`❌ [llm:${provider.name}] Max tool depth (${maxDepth}) reached.`);
@@ -218,77 +305,75 @@ async function tryProvider(
         };
       }
 
-      const call = result.toolCalls[0];
-      const toolName = call.function.name;
-
       if (verbose) {
-        console.log(`🛠️  [llm:${provider.name}] Tool: ${toolName} (Depth: ${depth + 1}/${maxDepth})`);
+        const toolNames = result.toolCalls.map((tc) => tc.function.name).join(", ");
+        console.log(`🛠️  [llm:${provider.name}] ${result.toolCalls.length} tool call(s): [${toolNames}] (Depth: ${depth + 1}/${maxDepth})`);
       }
 
-      // Handle internal thinking tool
-      if (toolName === "internal_thought_process") {
-        const alreadyThought = messages.some(
-          (m) => m.tool_calls && m.tool_calls.some((tc) => tc.function.name === "internal_thought_process")
-        );
+      // Build the assistant message with ALL tool calls attached (OpenAI API format)
+      const nextMessages: ChatMessage[] = [
+        ...messages,
+        { role: "assistant", content: result.content || "", tool_calls: result.toolCalls },
+      ];
 
-        if (alreadyThought) {
-          if (verbose) console.error(`⚠️ [llm:${provider.name}] Blocked duplicate thought call.`);
-          const nextMessages: ChatMessage[] = [
-            ...messages,
-            { role: "assistant", content: result.content || "", tool_calls: [call] },
-            {
+      let allThoughts = true;
+      let shouldAbort = false;
+      let abortResult: LLMProviderResult = { answer: null, rateLimited: false };
+
+      // Process each tool call sequentially
+      for (const call of result.toolCalls) {
+        const toolName = call.function.name;
+
+        // ── Handle internal thinking tool ──
+        if (toolName === "internal_thought_process") {
+          const alreadyThought = messages.some(
+            (m) => m.tool_calls && m.tool_calls.some((tc) => tc.function.name === "internal_thought_process")
+          );
+
+          if (alreadyThought) {
+            if (verbose) console.error(`⚠️ [llm:${provider.name}] Blocked duplicate thought call.`);
+            nextMessages.push({
               role: "tool",
               tool_call_id: call.id,
               content: "ERROR: You have ALREADY used the internal_thought_process tool. Provide your final answer now.",
-            },
-          ];
-          clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
+            });
+            continue;
+          }
+
+          let args: Record<string, unknown>;
+          try {
+            args = JSON.parse(call.function.arguments);
+          } catch {
+            nextMessages.push({ role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." });
+            continue;
+          }
+
+          if (verbose) console.log(`🧠 [thinking via tool] ${provider.name}: ${(args.thought as string).slice(0, 200)}...`);
+          // Truncate thought to 3-4 lines max for clean UI
+          const thinkLines = (args.thought as string).split("\n").slice(0, 4).join("\n");
+          onThought?.(thinkLines);
+          onStatus?.("analyzing");
+
+          nextMessages.push({ role: "tool", tool_call_id: call.id, content: "Thought logged. Provide your final answer now." });
+          continue;
+        }
+
+        // ── Handle custom tool calls ──
+        allThoughts = false;
+        const handler = config.toolHandlers?.[toolName];
+
+        if (!handler) {
+          if (verbose) console.warn(`⚠️ [llm:${provider.name}] No handler for tool: ${toolName}`);
+          nextMessages.push({ role: "tool", tool_call_id: call.id, content: `ERROR: No handler registered for tool "${toolName}".` });
+          continue;
         }
 
         let args: Record<string, unknown>;
         try {
           args = JSON.parse(call.function.arguments);
         } catch {
-          const nextMessages: ChatMessage[] = [
-            ...messages,
-            { role: "assistant", content: result.content || "", tool_calls: [call] },
-            { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
-          ];
-          clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
-        }
-
-        if (verbose) console.log(`🧠 [thinking via tool] ${provider.name}: ${(args.thought as string).slice(0, 200)}...`);
-        // Truncate thought to 3-4 lines max for clean UI
-        const lines = (args.thought as string).split("\n").slice(0, 4).join("\n");
-        onThought?.(lines);
-        onStatus?.("analyzing");
-
-        const nextMessages: ChatMessage[] = [
-          ...messages,
-          { role: "assistant", content: result.content || "", tool_calls: [call] },
-          { role: "tool", tool_call_id: call.id, content: "Thought logged. Provide your final answer now." },
-        ];
-        clearTimeout(timeout);
-        // Don't increment depth for thinking — don't punish reasoning
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth, toolFailures);
-      }
-
-      // Handle custom tool calls
-      const handler = config.toolHandlers?.[toolName];
-      if (handler) {
-        let args: Record<string, unknown>;
-        try {
-          args = JSON.parse(call.function.arguments);
-        } catch {
-          const nextMessages: ChatMessage[] = [
-            ...messages,
-            { role: "assistant", content: result.content || "", tool_calls: [call] },
-            { role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." },
-          ];
-          clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
+          nextMessages.push({ role: "tool", tool_call_id: call.id, content: "Error: Invalid JSON arguments." });
+          continue;
         }
 
         // Duplicate tool call blocking
@@ -302,17 +387,12 @@ async function tryProvider(
 
         if (alreadyCalled) {
           if (verbose) console.error(`⚠️ [llm:${provider.name}] Blocked duplicate ${toolName} call.`);
-          const nextMessages: ChatMessage[] = [
-            ...messages,
-            { role: "assistant", content: result.content || "", tool_calls: [call] },
-            {
-              role: "tool",
-              tool_call_id: call.id,
-              content: `ERROR: You have ALREADY called ${toolName} with these exact arguments. Use the data you already have.`,
-            },
-          ];
-          clearTimeout(timeout);
-          return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
+          nextMessages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: `ERROR: You have ALREADY called ${toolName} with these exact arguments. Use the data you already have.`,
+          });
+          continue;
         }
 
         onStatus?.(toolName.replace(/_/g, " "));
@@ -325,11 +405,11 @@ async function tryProvider(
           toolResult = `Tool error: ${e instanceof Error ? e.message : String(e)}`;
         }
 
-        onToolResult?.(toolName, toolResult.slice(0, 2000));
-
+        onToolResult?.(toolName, (toolResult || "").slice(0, 2000));
         onStatus?.("analyzing");
 
-        const isError = toolResult.toLowerCase().includes("error") || toolResult.toLowerCase().includes("failed") || toolResult.toLowerCase().includes("exception");
+        // Track errors for safety limits
+        const isError = (toolResult || "").toLowerCase().includes("error") || (toolResult || "").toLowerCase().includes("failed") || (toolResult || "").toLowerCase().includes("exception");
         if (isError) {
           toolFailures[toolName] = (toolFailures[toolName] || 0) + 1;
         }
@@ -338,30 +418,36 @@ async function tryProvider(
 
         if (toolFailures[toolName] >= 2) {
           if (verbose) console.error(`❌ [llm:${provider.name}] Tool ${toolName} failed 2 times. Aborting retry loop.`);
-          return {
+          shouldAbort = true;
+          abortResult = {
             answer: `I tried to use the ${toolName} tool but it failed multiple times. Please check the logs. Last error: ${toolResult}`,
             rateLimited: false,
             error: "tool_failure_limit",
           };
+          nextMessages.push({ role: "tool", tool_call_id: call.id, content: (toolResult || "").slice(0, 6000) });
+          break;
         }
 
         if (totalFailures >= 3) {
-          if (verbose) console.error(`❌ [llm:${provider.name}] Global tool failure limit reached (${totalFailures} total errors). Aborting loop to prevent runaway execution.`);
-          return {
+          if (verbose) console.error(`❌ [llm:${provider.name}] Global tool failure limit reached (${totalFailures} total errors). Aborting loop.`);
+          shouldAbort = true;
+          abortResult = {
             answer: `I have encountered multiple errors while trying to complete this task. To prevent further issues, I have stopped trying. Please review the logs to see what went wrong.`,
             rateLimited: false,
             error: "global_tool_failure_limit",
           };
+          nextMessages.push({ role: "tool", tool_call_id: call.id, content: (toolResult || "").slice(0, 6000) });
+          break;
         }
 
-        const nextMessages: ChatMessage[] = [
-          ...messages,
-          { role: "assistant", content: result.content || "", tool_calls: [call] },
-          { role: "tool", tool_call_id: call.id, content: toolResult.slice(0, 6000) },
-        ];
-        clearTimeout(timeout);
-        return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, depth + 1, toolFailures);
+        nextMessages.push({ role: "tool", tool_call_id: call.id, content: (toolResult || "").slice(0, 6000) });
       }
+
+      clearTimeout(timeout);
+      if (shouldAbort) return abortResult;
+
+      // Don't increment depth for thinking-only rounds — don't punish reasoning
+      return tryProvider(provider, nextMessages, config, temperature, maxTokens, timeoutMs, onStatus, onThought, onToken, onToolCall, onToolResult, allThoughts ? depth : depth + 1, toolFailures);
     }
 
     // Return final answer

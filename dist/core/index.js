@@ -1,3 +1,3 @@
-export { answerChatWithGeminiNatively, createLLMClient, describeImageWithGemini, extractPdfWithGemini, extractResponse, extractTextFromAttachment } from '../chunk-Q7Y2NYJP.js';
+export { answerChatWithGeminiNatively, createLLMClient, describeImageWithGemini, extractPdfWithGemini, extractResponse, extractTextFromAttachment } from '../chunk-SEKNIZ7K.js';
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
